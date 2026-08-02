@@ -742,6 +742,15 @@ function M.setup(opts)
   end
 end
 
+--- True if PKM highlighting is currently active on the buffer. Lets a consumer
+--- (pkm-nvim's :PKMSyntax toggle) read the on/off state without tracking its own.
+---@param bufnr integer  Buffer handle (0 = current buffer)
+---@return boolean
+function M.is_active(bufnr)
+  bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+  return _active_bufs[bufnr] == true
+end
+
 M._find_meta_comments = find_meta_comments
 M._find_subalinea_markers = find_subalinea_markers
 

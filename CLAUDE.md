@@ -11,8 +11,8 @@ the frontmatter; it has **no dependency on pkm-nvim** and must stay that way.
   and installable on its own. (The roman validator, for example, is duplicated
   here rather than imported.) A dependency on pkm-nvim defeats the extraction.
 - **The public API is a contract with pkm-nvim.** `enable(bufnr, highlight_only)`,
-  `disable(bufnr)`, `refresh_fold(bufnr)`, `foldtext()`, `setup(opts)`, plus the
-  `*_list_pattern` and `_find_*` exports the tests assert. pkm-nvim consumes this
+  `disable(bufnr)`, `is_active(bufnr)`, `refresh_fold(bufnr)`, `foldtext()`,
+  `setup(opts)`, plus the `*_list_pattern` and `_find_*` exports the tests assert. pkm-nvim consumes this
   through its thin `pkm.syntax` facade, so renaming or changing the shape of these
   breaks pkm-nvim — change them in lockstep across both repos. `setup(opts)` takes
   `{ highlight_only?, number? }`; `number = false` hides line numbers (the note
