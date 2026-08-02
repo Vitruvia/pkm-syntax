@@ -14,7 +14,10 @@ the frontmatter; it has **no dependency on pkm-nvim** and must stay that way.
   `disable(bufnr)`, `refresh_fold(bufnr)`, `foldtext()`, `setup(opts)`, plus the
   `*_list_pattern` and `_find_*` exports the tests assert. pkm-nvim consumes this
   through its thin `pkm.syntax` facade, so renaming or changing the shape of these
-  breaks pkm-nvim — change them in lockstep across both repos.
+  breaks pkm-nvim — change them in lockstep across both repos. `setup(opts)` takes
+  `{ highlight_only?, number? }`; `number = false` hides line numbers (the note
+  look), default keeps them. This is standalone-only — pkm-nvim never calls
+  `setup()`, so its `enable()`-driven note look (numbers hidden) is unaffected.
 - **This is where the highlighting source of truth now lives.** Do not re-add a
   copy of `syntax.lua` or the `queries/` to pkm-nvim — they were removed there on
   purpose (two copies on the runtimepath double-apply the `; extends` query).

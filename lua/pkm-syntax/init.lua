@@ -13,8 +13,11 @@
 -- through the thin `pkm.syntax` facade.
 --
 -- Standalone use:
---   require('pkm-syntax').setup()            -- highlight every markdown buffer
---   require('pkm-syntax').setup({ highlight_only = true })  -- no frontmatter fold
+--   require('pkm-syntax').setup()            -- highlight every markdown buffer,
+--                                               fold frontmatter, keep line numbers
+--   require('pkm-syntax').setup({ highlight_only = true })  -- highlight only, no fold
+--   require('pkm-syntax').setup({ number = false })         -- adopt the note look
+--                                               (fold + line numbers hidden)
 --
 -- Manages PKM-specific tree-sitter syntax highlighting for markdown buffers.
 -- Called by mode.lua on activate/deactivate; tracks state per-buffer and
@@ -66,6 +69,13 @@ local _win_matches = {}
 
 -- Buffer handles with PKM highlighting active. bufnr → true
 local _active_bufs = {}
+
+-- Standalone display preference. The frontmatter-fold path (setup_win_opts) also
+-- hides line numbers — the PKM-note look. pkm-nvim drives enable() directly and
+-- wants that; a standalone `setup()` user gets their line numbers *kept* unless
+-- they pass `number = false`. setup() sets this flag; enable() never does, so the
+-- module default preserves pkm-nvim's behaviour exactly.
+local _display = { hide_numbers = true }
 
 -- Global autocmds (WinClosed, ColorScheme) registered only once.
 local _global_autocmds_set = false
@@ -333,8 +343,13 @@ local function setup_win_opts(win_id)
     vim.wo.foldenable     = true
     vim.wo.foldcolumn     = '0'
     vim.wo.foldtext       = "v:lua.require('pkm-syntax').foldtext()"
-    vim.wo.number         = false
-    vim.wo.relativenumber = false
+    -- Hiding line numbers is the note look, not a highlighting concern; a
+    -- standalone user who wants the frontmatter fold on ordinary markdown keeps
+    -- their numbers unless they opt into number = false (see M.setup).
+    if _display.hide_numbers then
+      vim.wo.number         = false
+      vim.wo.relativenumber = false
+    end
 
     -- Check the window's actual fold state instead of a memoized flag — a
     -- flag keyed only by win_id survives a buffer switch in a reused window
@@ -703,9 +718,17 @@ end
 --- Standalone activation: highlight every markdown buffer as it loads (and any
 --- already open). pkm-nvim does NOT call this — it drives enable() itself; this
 --- is for installing pkm-syntax on its own.
----@param opts table|nil  { highlight_only?: boolean }  highlight_only skips the fold
+---@param opts table|nil  {
+---   highlight_only?: boolean,  -- highlighting only; skip the frontmatter fold
+---   number?:         boolean,  -- false = hide line numbers (the note look);
+---                              --   default keeps them (a plain .md is not a note)
+--- }
 function M.setup(opts)
   opts = opts or {}
+  -- A plain markdown file is not a PKM note, so standalone keeps the user's line
+  -- numbers by default; pass number = false to adopt the note look. pkm-nvim
+  -- never calls setup(), so the module default (hide) leaves its notes untouched.
+  _display.hide_numbers = (opts.number == false)
   local grp = vim.api.nvim_create_augroup('PKMSyntaxStandalone', { clear = true })
   vim.api.nvim_create_autocmd('FileType', {
     group    = grp,
