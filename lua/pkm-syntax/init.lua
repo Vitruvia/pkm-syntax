@@ -52,6 +52,19 @@
 --   heading by CommonMark and is highlighted accordingly. Use a blank line
 --   before --- to produce a thematic break instead.
 --
+--   A line that is a bare HTML/XML tag — <tag>, <tag attr="x">, and importantly
+--   the type-1 openers <pre>/<script>/<style>/<textarea> — starts a CommonMark
+--   *HTML block*. The bundled markdown grammar (which owns block segmentation;
+--   this module cannot change it) then folds every following line into that block
+--   until a blank line (type 6/7) or the matching close tag / end of file (type 1).
+--   Headings and other elements caught inside lose their tree-sitter highlight —
+--   the reported "<...> line reads like a header and highlights vanish below it".
+--   The tag *name* itself is still coloured by the PKMXmlTag matchadd below, which
+--   is independent of the parser. Workarounds: leave a blank line after the marker
+--   (bounds a type 6/7 block to that line), write it inside backticks (`<tag>`), or
+--   use an underscore in the name (<a_b>) — an underscore is not a valid HTML tag
+--   name, so the line stays an ordinary paragraph and nothing below is swallowed.
+--
 -- Public API:
 --   enable(bufnr)   → activate PKM highlighting on buffer
 --   disable(bufnr)  → deactivate PKM highlighting; restore Vimscript syntax
@@ -175,6 +188,14 @@ local function setup_hl_groups()
   -- §9 meta-comment highlight: ((text)) double-paren convention.
   vim.api.nvim_set_hl(0, 'PKMMetaComment', { link = 'Comment' })
 
+  -- XML/angle-bracket markers: <tag>, </tag>, <tag/>, <placeholder_name> — the
+  -- markers people drop into notes (`<deslocamento-exemplo-1>`). tree-sitter does
+  -- not colour these on their own (and a bare <tag> line is often swallowed into
+  -- an html_block; see the "Known behaviour" note), so they are matchadd'd here.
+  -- Linked to Identifier so they read as a named marker, distinct from the bold
+  -- Special used for citations.
+  vim.api.nvim_set_hl(0, 'PKMXmlTag', { link = 'Identifier' })
+
   -- YAML injection: replace distracting pink/magenta with subdued colours.
   vim.api.nvim_set_hl(0, '@property.yaml',              { link = 'Identifier' })
   vim.api.nvim_set_hl(0, '@string.yaml',                { link = 'Normal'     })
@@ -241,6 +262,19 @@ local PARAGRAFO_LIST_PATTERN = [=[\C\v^[ \t>]*\zs§ +\d+º?\ze(\s|$)]=]
 M.artigo_list_pattern    = ARTIGO_LIST_PATTERN
 M.paragrafo_list_pattern = PARAGRAFO_LIST_PATTERN
 
+--- The matchadd pattern for XML/angle-bracket markers — `<tag>`, `</tag>`,
+--- `<tag/>`, `<tag attr="x">`, and bare placeholder markers `<deslocamento_exemplo-1>`.
+--- The name must start with a letter and may carry letters/digits/`_`/`-` (so the
+--- underscore-and-hyphen placeholders people write are covered); `%(\s[^<>]*)?`
+--- allows an attribute run without letting the match cross into a second tag, and
+--- the whole thing is bounded by literal `<`…`>` (`\<`/`\>` in \v). The leading
+--- `[A-Za-z]` requirement keeps it off prose comparisons (`a < b > c`) and
+--- emoticons (`<3`). matchadd, so it fires by regex independently of tree-sitter —
+--- which is why it still colours a marker line that the grammar folded into an
+--- html_block. Exposed so a test can assert it.
+local XML_TAG_PATTERN = [=[\v\<\/?[A-Za-z][A-Za-z0-9_-]*%(\s[^<>]*)?\/?\>]=]
+M.xml_tag_pattern = XML_TAG_PATTERN
+
 --- Register match-based highlights in a single window.
 --- Idempotent: returns immediately if window already has PKM matches.
 ---@param win_id integer
@@ -271,6 +305,12 @@ local function setup_win_matches(win_id)
   -- (prefix + digit), so plain matchadd; no tree-sitter node either.
   add('PKMListMarker', ARTIGO_LIST_PATTERN, 10, { window = win_id })
   add('PKMListMarker', PARAGRAFO_LIST_PATTERN, 10, { window = win_id })
+
+  -- XML/angle-bracket markers (<tag>, </tag>, <tag/>, <placeholder>): tree-sitter
+  -- does not colour them, and a bare marker line is often swallowed into an
+  -- html_block (see the module's "Known behaviour"); matchadd paints the marker
+  -- itself regardless.
+  add('PKMXmlTag', XML_TAG_PATTERN, 10, { window = win_id })
 
   -- Subalínea markers (i., ii., …) need a canonical-roman check matchadd cannot
   -- do, so they are extmark-highlighted via refresh_subalinea_markers() below.
@@ -455,20 +495,51 @@ local function find_meta_comments(lines)
     return lo - 1, byte_offset - offsets[lo]  -- 0-based row, 0-based byte col
   end
 
+  local n = #text
   local results = {}
-  local search_from = 1
-  while true do
-    local s, e = text:find('%(%(.-%)%)', search_from)
+  local i = 1
+  while i <= n do
+    local s = text:find('((', i, true)   -- next literal "((" (plain find)
     if not s then break end
-    local start_row, start_col = offset_to_pos(s - 1)
-    local end_row,   end_col   = offset_to_pos(e)
-    if (end_row - start_row) <= MAX_META_COMMENT_LINES then
+
+    -- Balanced scan from the opening "((": each '(' deepens the nesting, each
+    -- ')' closes one level, and the comment ends at the ')' that returns the
+    -- depth to 0 — the one that balances the opening pair. A lazy `.-)` used to
+    -- stop at the FIRST "))", so a comment whose text ended in a parenthetical
+    -- (… nível 2))) lost its final ')': the inner "(aside)"'s close plus the
+    -- first meta ')' looked like the closing "))". Counting depth fixes that.
+    -- Bounded to MAX_META_COMMENT_LINES so a stray unmatched "((" cannot scan
+    -- (and, once matched, paint) the rest of the document.
+    local depth    = 0
+    local newlines = 0
+    local e        = nil
+    for j = s, n do
+      local c = text:byte(j)
+      if c == 40 then            -- '('
+        depth = depth + 1
+      elseif c == 41 then        -- ')'
+        depth = depth - 1
+        if depth == 0 then e = j; break end
+      elseif c == 10 then        -- '\n'
+        newlines = newlines + 1
+        if newlines > MAX_META_COMMENT_LINES then break end
+      end
+    end
+
+    -- A real ((...)) closes on a double ')'. If the balancing ')' is preceded by
+    -- a non-')' (unbalanced inner parens, e.g. "((a)b)"), it is not a
+    -- meta-comment — skip past this "((" and keep scanning.
+    if e and e >= 2 and text:byte(e - 1) == 41 then
+      local start_row, start_col = offset_to_pos(s - 1)
+      local end_row,   end_col   = offset_to_pos(e)
       results[#results + 1] = {
         start_row = start_row, start_col = start_col,
         end_row = end_row, end_col = end_col,
       }
+      i = e + 1
+    else
+      i = s + 2
     end
-    search_from = e + 1
   end
   return results
 end
