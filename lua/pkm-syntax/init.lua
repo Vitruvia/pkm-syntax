@@ -55,15 +55,23 @@
 --   A line that is a bare HTML/XML tag — <tag>, <tag attr="x">, and importantly
 --   the type-1 openers <pre>/<script>/<style>/<textarea> — starts a CommonMark
 --   *HTML block*. The bundled markdown grammar (which owns block segmentation;
---   this module cannot change it) then folds every following line into that block
---   until a blank line (type 6/7) or the matching close tag / end of file (type 1).
---   Headings and other elements caught inside lose their tree-sitter highlight —
---   the reported "<...> line reads like a header and highlights vanish below it".
---   The tag *name* itself is still coloured by the PKMXmlTag matchadd below, which
---   is independent of the parser. Workarounds: leave a blank line after the marker
---   (bounds a type 6/7 block to that line), write it inside backticks (`<tag>`), or
---   use an underscore in the name (<a_b>) — an underscore is not a valid HTML tag
---   name, so the line stays an ordinary paragraph and nothing below is swallowed.
+--   this module cannot change it) then folds every following line into a single
+--   html_block node until a blank line (type 6/7) or the matching close tag / end
+--   of file (type 1): the lines inside are not parsed as separate headings/lists
+--   at the tree-sitter level. This was reported as "<...> line reads like a header
+--   and the highlights vanish below it", but on smoke (v1.70.0) it did NOT
+--   reproduce visibly — a following `## heading` still displays highlighted.
+--   Vim's own regex markdown syntax colours `#` heading markers (and much else)
+--   line-by-line, independent of block segmentation, and runs alongside the
+--   tree-sitter highlighting `enable()` starts; so the parse-tree folding rarely
+--   has a visible effect. The tag *name* itself is always coloured, by the
+--   PKMXmlTag matchadd below (also matchadd, also parser-independent). If a
+--   stripped setup (tree-sitter only, Vim syntax off) ever does show elements
+--   below a bare tag losing colour, any of these restores separate parsing:
+--   leave a blank line after the marker (bounds a type 6/7 block to that line),
+--   write it inside backticks (`<tag>`), or put an underscore in the name (<a_b>)
+--   — an underscore is not a valid HTML tag name, so the line stays an ordinary
+--   paragraph.
 --
 -- Public API:
 --   enable(bufnr)   → activate PKM highlighting on buffer
