@@ -30,14 +30,17 @@
 --                 queries/markdown/injections.scm  (YAML frontmatter; needs yaml parser)
 --               match-based highlight via vim.fn.matchadd (per-window):
 --                 PKMCitation   — note[0042], bib[...], journal[...], scratch[...]
---                 PKMListMarker — legal markers with no tree-sitter node: inciso
---                 (I -), alínea (a)), artigo (Art. Nº), parágrafo (§ Nº)
+--                 PKMListMarker — legal markers with no tree-sitter node:
+--                 alínea (a)), artigo (Art. Nº), parágrafo (§ Nº)
 --               extmark-based highlight (buffer-scoped, multi-line capable):
 --                 PKMMetaComment — ((text)) double-paren meta-comments (§9
 --                 conventions)
---                 PKMListMarker — subalínea (i.), validated as canonical roman
---                 (matchadd cannot); all rescanned on enable, save, and
---                 (debounced) on text change
+--                 PKMListMarker — subalínea (i.) and inciso (I -), validated as
+--                 canonical roman (matchadd cannot). Inciso is block-aware: an
+--                 uppercase-alpha list (A -, B -, C -, …) suppresses roman
+--                 painting across the whole block, so its C-/D-/I- items are not
+--                 mis-coloured. All rescanned on enable, save, and (debounced)
+--                 on text change
 --               fold (foldmethod=manual):
 --                 frontmatter fold created on enable, recreated after save
 --               'markdown' injections query overridden at runtime to drop
@@ -132,6 +135,13 @@ local _meta_comment_timers = {}
 -- Highlighted through a validated buffer scan rather than matchadd, because the
 -- match depends on a canonical-roman check the regex engine cannot express.
 local SUBALINEA_NS = vim.api.nvim_create_namespace('pkm_subalinea')
+
+-- Buffer-scoped extmark namespace for inciso markers (uppercase roman + ' - ').
+-- These moved off matchadd because the decision is block-aware, not per-line: an
+-- uppercase-alpha list (A -, B -, C - …) contains roman-letter items (C, D, I, L,
+-- M, V, X) that a stateless regex would paint as incisos. The scan groups a list
+-- into a block and only paints it when EVERY marker is a canonical roman numeral.
+local INCISO_NS = vim.api.nvim_create_namespace('pkm_inciso')
 
 -- Self-contained roman validator. This module keeps `Dependencies: none`, so it
 -- deliberately does NOT require pkm.markdown for the twin of this check — that
@@ -238,6 +248,13 @@ M.citation_pattern = CITATION_PATTERN
 --- 'ignorecase', which the real config sets, and without `\C` the collection
 --- `[IVXLCDM]` would also fold to lowercase and paint words like `civil -`.
 --- Exposed so a test can assert it.
+---
+--- NOTE (v1.76.0): this pattern is no longer wired into matchadd — inciso is now
+--- painted block-aware through find_inciso_markers()/refresh_inciso_markers() so
+--- an uppercase-alpha list (A -, B -, C - …) does not get its roman-letter items
+--- mis-coloured. The constant is kept as the single-line recognition SPEC (and is
+--- still pinned by the test): the Lua scan applies the same per-line shape, then
+--- adds the block-level canonical-roman gate the regex cannot express.
 local INCISO_LIST_PATTERN = [=[\C\v^[ \t>]*\zs[IVXLCDM]+ +-\ze(\s|$)]=]
 M.inciso_list_pattern = INCISO_LIST_PATTERN
 
@@ -301,9 +318,10 @@ local function setup_win_matches(win_id)
   -- Citations: note[id], bib[id], journal[id], scratch[id]
   add('PKMCitation', CITATION_PATTERN, 10, { window = win_id })
 
-  -- Legal inciso markers (I -, II -, …): tree-sitter emits no list node for them,
-  -- so highlight the marker here to match the native list-marker colour.
-  add('PKMListMarker', INCISO_LIST_PATTERN, 10, { window = win_id })
+  -- Legal inciso markers (I -, II -, …) are NOT matchadd'd — the roman-vs-alpha
+  -- decision is block-aware (an A -/B -/C - list must not paint its C -/D -/I -
+  -- items), which a per-line regex cannot do. They are extmark-highlighted via
+  -- refresh_inciso_markers() below, alongside the subalínea scan.
 
   -- Lettered list markers (a), b), …): likewise no tree-sitter list node — the
   -- paren form only, to keep prose (abbreviations like "vs.") unpainted.
@@ -605,6 +623,94 @@ local function refresh_subalinea_markers(bufnr)
   end
 end
 
+--- Scan buffer lines for legal *inciso* markers — uppercase letters + ' - ' at
+--- line start (behind optional indentation/blockquote) — and return only the
+--- markers that belong to a genuine roman-inciso list. Pure function.
+---
+--- Why a scan and not matchadd: an uppercase-alphabetic list writes markers as
+--- `A -`, `B -`, `C - …`, and several of those letters (C, D, I, L, M, V, X) are
+--- valid roman numerals. A per-line regex would paint exactly those items and
+--- leave A/B/E/… plain — a ransom-note list. The fix is block-level: a contiguous
+--- run of same-indent markers is painted only when EVERY marker is a canonical
+--- roman numeral; if any marker is a non-roman letter the whole run is an alpha
+--- list and none of it is painted. A lone marker is its own block, so a standalone
+--- `C - …` reference still reads as an inciso (as it did under matchadd).
+---
+--- Block boundary: a change of indent width, or a blank line between two markers,
+--- starts a new block. Non-blank continuation lines (wrapped inciso text) stay
+--- inside the block.
+---@param lines string[]
+---@return {row:integer, sc:integer, ec:integer}[]  0-based row, byte cols of each painted marker
+local function find_inciso_markers(lines)
+  -- Pass 1: collect candidate marker lines (uppercase run + ' - ', hyphen
+  -- followed by whitespace or end-of-line — mirrors INCISO_LIST_PATTERN's shape).
+  local cands = {}
+  for i, line in ipairs(lines) do
+    local indent, tok, sep = line:match('^([ \t>]*)([A-Z]+)( +%-)')
+    if indent then
+      local after = line:sub(#indent + #tok + #sep + 1, #indent + #tok + #sep + 1)
+      if after == '' or after:match('%s') then
+        cands[#cands + 1] = {
+          row    = i - 1,
+          sc     = #indent,
+          ec     = #indent + #tok + #sep,
+          tok    = tok,
+          indent = #indent,
+        }
+      end
+    end
+  end
+
+  -- Pass 2: split candidates into blocks (same indent, no blank line between).
+  local results = {}
+  local block = {}
+  local function flush()
+    if #block == 0 then return end
+    local all_roman = true
+    for _, c in ipairs(block) do
+      if not is_valid_roman(c.tok:lower()) then all_roman = false; break end
+    end
+    if all_roman then
+      for _, c in ipairs(block) do
+        results[#results + 1] = { row = c.row, sc = c.sc, ec = c.ec }
+      end
+    end
+    block = {}
+  end
+
+  for _, c in ipairs(cands) do
+    local prev = block[#block]
+    if prev then
+      local same_indent = (c.indent == prev.indent)
+      local blank_between = false
+      for r = prev.row + 1, c.row - 1 do
+        if (lines[r + 1] or ''):match('^%s*$') then blank_between = true; break end
+      end
+      if not same_indent or blank_between then flush() end
+    end
+    block[#block + 1] = c
+  end
+  flush()
+
+  return results
+end
+
+--- Rescan a buffer for inciso markers and reapply PKMListMarker extmarks over the
+--- roman markers of each genuine inciso block (uppercase-alpha lists suppressed).
+---@param bufnr integer
+local function refresh_inciso_markers(bufnr)
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return end
+  vim.api.nvim_buf_clear_namespace(bufnr, INCISO_NS, 0, -1)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  for _, m in ipairs(find_inciso_markers(lines)) do
+    pcall(vim.api.nvim_buf_set_extmark, bufnr, INCISO_NS, m.row, m.sc, {
+      end_col  = m.ec,
+      hl_group = 'PKMListMarker',
+      priority = 100,   -- alongside tree-sitter's default list-marker priority
+    })
+  end
+end
+
 --- Debounced wrapper for high-frequency callers (TextChanged/TextChangedI).
 --- A full buffer scan on every keystroke would reintroduce the same
 --- O(n)-per-edit cost the injection override above exists to avoid on
@@ -620,6 +726,7 @@ local function schedule_meta_comment_refresh(bufnr)
     if _active_bufs[bufnr] and vim.api.nvim_buf_is_valid(bufnr) then
       refresh_meta_comments(bufnr)
       refresh_subalinea_markers(bufnr)
+      refresh_inciso_markers(bufnr)
     end
   end, 150)
 end
@@ -693,6 +800,7 @@ function M.enable(bufnr, highlight_only)
     end
     refresh_meta_comments(bufnr)
     refresh_subalinea_markers(bufnr)
+    refresh_inciso_markers(bufnr)
   end)
 
   local ag = get_augroup()
@@ -736,6 +844,7 @@ function M.enable(bufnr, highlight_only)
 
       refresh_meta_comments(bufnr)
       refresh_subalinea_markers(bufnr)
+      refresh_inciso_markers(bufnr)
     end,
   })
 
@@ -788,6 +897,7 @@ function M.disable(bufnr)
   end
   pcall(vim.api.nvim_buf_clear_namespace, bufnr, META_COMMENT_NS, 0, -1)
   pcall(vim.api.nvim_buf_clear_namespace, bufnr, SUBALINEA_NS, 0, -1)
+  pcall(vim.api.nvim_buf_clear_namespace, bufnr, INCISO_NS, 0, -1)
 
   vim.api.nvim_buf_call(bufnr, function()
     vim.cmd('syntax on')
@@ -832,5 +942,6 @@ end
 
 M._find_meta_comments = find_meta_comments
 M._find_subalinea_markers = find_subalinea_markers
+M._find_inciso_markers = find_inciso_markers
 
 return M
